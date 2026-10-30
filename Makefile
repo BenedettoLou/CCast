@@ -7,6 +7,12 @@ LDFLAGS = -framework Cocoa -framework Carbon
 TARGET = ccast
 BUILD = build
 
+APP_NAME = CCast
+APP_BUNDLE = $(APP_NAME).app
+DMG_NAME = $(APP_NAME).dmg
+DMG_DIR = $(BUILD)/dmg_root
+PLIST = resources/Info.plist
+
 # Objective-C++ (UI) and pure C++ (core) sources
 SRCS_MM  = src/main.mm src/ui/window.mm src/ui/search.mm src/ui/resultViews.mm src/ui/hotkey.mm
 SRCS_CPP = src/core/searchApplication.cpp src/core/searchFile.cpp src/core/searchUtils.cpp
@@ -30,9 +36,30 @@ $(BUILD)/%.cpp.o: src/%.cpp
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -rf $(BUILD) $(TARGET) a.out
+	rm -rf $(BUILD) $(TARGET) $(APP_BUNDLE) $(DMG_NAME) a.out
 
 run: all
 	./$(TARGET)
 
-.PHONY: all clean run
+app: $(TARGET) $(PLIST)
+	@echo "Packaging $(APP_BUNDLE)..."
+	@rm -rf $(APP_BUNDLE)
+	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
+	@mkdir -p $(APP_BUNDLE)/Contents/Resources
+	@cp $(TARGET) $(APP_BUNDLE)/Contents/MacOS/$(TARGET)
+	@cp $(PLIST) $(APP_BUNDLE)/Contents/Info.plist
+	@if [ -f resources/AppIcon.icns ]; then cp resources/AppIcon.icns $(APP_BUNDLE)/Contents/Resources/; fi
+	@codesign --force --deep --sign - $(APP_BUNDLE) 2>/dev/null || true
+	@echo "Created $(APP_BUNDLE)"
+
+dmg: app
+	@echo "Creating $(DMG_NAME)..."
+	@rm -rf $(DMG_DIR) $(DMG_NAME)
+	@mkdir -p $(DMG_DIR)
+	@cp -R $(APP_BUNDLE) $(DMG_DIR)/
+	@ln -s /Applications $(DMG_DIR)/Applications
+	@hdiutil create -volname "$(APP_NAME)" -srcfolder "$(DMG_DIR)" -ov -format UDZO "$(DMG_NAME)"
+	@rm -rf $(DMG_DIR)
+	@echo "Created $(DMG_NAME)"
+
+.PHONY: all clean run app dmg
