@@ -35,4 +35,7 @@ clean:
 run: all
 	./$(TARGET)
 
-.PHONY: all clean run
+compdb:
+	@python3 -c "import subprocess, json, os; cwd = os.getcwd(); res = subprocess.run(['$(MAKE)', '-n', 'all'], capture_output=True, text=True); entries = []; [entries.append({'directory': cwd, 'command': l.strip(), 'file': os.path.abspath(parts[parts.index('-c')+1])}) for l in res.stdout.strip().split('\n') if (parts := l.strip().split()) and '-c' in parts and parts[0] == 'clang++']; open('compile_commands.json', 'w').write(json.dumps(entries, indent=2)); print(f'Generated compile_commands.json ({len(entries)} files)')"
+
+.PHONY: all clean run compdb
