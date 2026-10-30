@@ -7,16 +7,16 @@
 static const CGFloat    kRowHeight  = 44.0;
 static const std::size_t kMaxResults = 20;
 
-// "FileMode" badge, on the left of the search box
+// "FileMode" badge
 static const CGFloat kBadgeWidth  = 78.0;
 static const CGFloat kBadgeHeight = 22.0;
 static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
 
 @implementation SearchController {
-  SearchEngine _engine;
+  SearchApplication _searchApplication;
   SearchFile _fileEngine;
-  std::vector<AppDetail> _results;   // apps or files, depending on _fileMode
-  BOOL _fileMode;                    // entered by typing '/' in the empty box
+  std::vector<AppDetail> _results;   // apps or files, depending on _mode
+  SearchMode _mode;                  // current application mode (APPMODE by default)
   NSRect _fieldFrame;                // search box frame in app mode
   NSTableView *_tableView;
   NSCache<NSString *, NSImage *> *_iconCache;
@@ -32,11 +32,12 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
     if (self) {
       _iconCache = [[NSCache alloc] init];
       _fieldFrame = frame;
+      _mode = APPMODE;
       [self setupSearchField:frame];
       [self setupModeBadge:frame];
       [self setupResultsView:frame.size.width];
 
-      _engine.setNameResolver([](const std::string &path) -> std::string {
+      _searchApplication.setNameResolver([](const std::string &path) -> std::string {
         @autoreleasepool {
           NSString *p = [NSString stringWithUTF8String:path.c_str()];
           NSString *name = [[NSFileManager defaultManager] displayNameAtPath:p];
@@ -55,7 +56,6 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
   - (void) setupSearchField: (NSRect) frame {
     NSTextField *field = [[NSTextField alloc] initWithFrame:frame];
 
-    // plain look: no border, no background, drawn over the window's dark layer
     field.bordered = NO;
     field.bezeled = NO;
     field.drawsBackground = NO;
@@ -87,7 +87,7 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
       }];
   }
 
-  // small rounded "FileMode" label, hidden in app mode
+  // "FileMode" label, hidden in app mode
   - (void) setupModeBadge: (NSRect) fieldFrame {
     NSRect frame = NSMakeRect(NSMinX(fieldFrame),
                               NSMidY(fieldFrame) - kBadgeHeight / 2.0,
@@ -153,34 +153,38 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
   }
 
   - (void) indexApplications {
-    _engine.indexApplications();
+    _searchApplication.indexApplications();
     [self updateResults];
   }
 
-  #pragma mark - Search
+  #pragma mark - Search Mode
 
-  // switches between app search and file browsing:
-  // shows / hides the badge and makes room for it next to the text
-  - (void) setFileMode: (BOOL) on {
-    if (_fileMode == on) return;
-    _fileMode = on;
+  - (SearchMode) mode {
+    return _mode;
+  }
+
+  - (void) setMode: (SearchMode) mode {
+    if (_mode == mode) return;
+    _mode = mode;
 
     // only x / width change: the vertical position is kept as it is, because
     // the box follows the window when it grows / shrinks (autoresizing) and
     // the y saved at init time is only valid for the compact window
-    const CGFloat shift = on ? kBadgeWidth + kBadgeGap : 0.0;
+    const BOOL isFileMode = (_mode == FILEMODE);
+    const CGFloat shift = isFileMode ? kBadgeWidth + kBadgeGap : 0.0;
     NSRect frame = _searchField.frame;
     frame.origin.x = NSMinX(_fieldFrame) + shift;
     frame.size.width = NSWidth(_fieldFrame) - shift;
     _searchField.frame = frame;
-    _modeBadge.hidden = !on;
+    _modeBadge.hidden = !isFileMode;
 
+    NSString *placeholderText = @"Search applications...";
+    if (_mode == FILEMODE) {
+      placeholderText = @"~/path/to/file";
+    }
     _searchField.placeholderAttributedString =
-      [self placeholder:(on ? @"~/path/to/file" : @"Search applications...")
-                   font:_searchField.font];
+      [self placeholder:placeholderText font:_searchField.font];
 
-    // the field editor (cursor + typed text) does not follow the new frame:
-    // restart the editing session so the box stays usable
     NSWindow *window = _searchField.window;
     if (window && _searchField.currentEditor) {
       [window makeFirstResponder:_searchField];
@@ -188,16 +192,23 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
     }
   }
 
-  - (void) updateResults {
+  #pragma mark - Search
 
+  - (void) updateResults {
     const char *text = _searchField.stringValue.UTF8String;
 
-    if (_fileMode) {
-      // find file: the box contains a clean path ("~/bin/", "/usr/", "Desktop")
-      _results = _fileEngine.query(text ? text : "", kMaxResults);
-    } else {
-      // search
-      _results = _engine.query(text ? text : "", kMaxResults);
+    switch (_mode) {
+      case FILEMODE:
+        _results = _fileEngine.query(text ? text : "", kMaxResults);
+        break;
+      case CLIPBOARD:
+        // clipboard mode is not implemented yet
+        _results.clear();
+        break;
+      case APPMODE:
+      default:
+        _results = _searchApplication.query(text ? text : "", kMaxResults);
+        break;
     }
 
     [_tableView reloadData];
@@ -225,7 +236,7 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
 
   - (void) rowClicked: (id) sender {
     (void)sender;
-    if (_fileMode) [self revealRow:_tableView.clickedRow];
+    if (_mode == FILEMODE) [self revealRow:_tableView.clickedRow];
     else [self launchRow:_tableView.clickedRow];
   }
 
@@ -316,7 +327,7 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
 
   // back to the initial state: empty box, app mode
   - (void) reset {
-    [self setFileMode:NO];
+    [self setMode:APPMODE];
     _searchField.stringValue = @"";
     [self updateResults];
   }
@@ -330,9 +341,9 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
     // '/' as first character: enter file mode, the '/' itself is consumed
     // so the box starts with a clean path ("~/bin/", "/usr/", ...).
     // A pasted absolute path ("/usr/bin") is kept as it is.
-    if (!_fileMode && [_searchField.stringValue hasPrefix:@"/"]) {
+    if (_mode != FILEMODE && [_searchField.stringValue hasPrefix:@"/"]) {
       NSString *text = _searchField.stringValue;
-      [self setFileMode:YES];
+      [self setMode:FILEMODE];
       _searchField.stringValue = (text.length == 1) ? @"" : text;
       [_searchField.currentEditor moveToEndOfLine:nil];
     }
@@ -358,8 +369,8 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
       return YES;
     }
 
-    // Backspace on the empty box leaves file mode
-    if (commandSelector == @selector(deleteBackward:) && _fileMode && empty) {
+    // Backspace on the empty box leaves file mode (returns to default APPMODE)
+    if (commandSelector == @selector(deleteBackward:) && _mode != APPMODE && empty) {
       [self reset];
       return YES;
     }
@@ -369,7 +380,7 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
       if (!empty) {
         _searchField.stringValue = @"";
         [self updateResults];
-      } else if (_fileMode) {
+      } else if (_mode != APPMODE) {
         [self reset];
       } else if (self.onDismiss) {
         self.onDismiss();
@@ -378,12 +389,12 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
     }
 
     if (commandSelector == @selector(insertNewline:)) {
-      if (_fileMode) [self revealTypedPathOrSelection];
+      if (_mode == FILEMODE) [self revealTypedPathOrSelection];
       else [self launchRow:_tableView.selectedRow];
       return YES;
     }
 
-    if (commandSelector == @selector(insertTab:) && _fileMode) {
+    if (commandSelector == @selector(insertTab:) && _mode == FILEMODE) {
       [self completeSelection];
       return YES;
     }

@@ -1,4 +1,5 @@
-#include "searchEngine.hpp"
+#include "searchApplication.hpp"
+#include "searchUtils.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -17,20 +18,9 @@ namespace {
     return p.extension() == ".app";
   }
 
-  bool isWordSeparator(char c) {
-    return c == ' ' || c == '-' || c == '_' || c == '.' || c == '(';
-  }
-
-  std::string trim(const std::string &s) {
-    const auto begin = s.find_first_not_of(" \t\r\n");
-    if (begin == std::string::npos) return {};
-    const auto end = s.find_last_not_of(" \t\r\n");
-    return s.substr(begin, end - begin + 1);
-  }
-
 } // namespace
 
-SearchEngine::SearchEngine() {
+SearchApplication::SearchApplication() {
   _searchPaths = {
     "/Applications",
     "/System/Applications",
@@ -43,11 +33,11 @@ SearchEngine::SearchEngine() {
   }
 }
 
-void SearchEngine::setSearchPaths(std::vector<std::string> paths) {
+void SearchApplication::setSearchPaths(std::vector<std::string> paths) {
   _searchPaths = std::move(paths);
 }
 
-void SearchEngine::setNameResolver(NameResolver resolver) {
+void SearchApplication::setNameResolver(NameResolver resolver) {
   _resolver = std::move(resolver);
 }
 
@@ -55,7 +45,7 @@ void SearchEngine::setNameResolver(NameResolver resolver) {
  * Indexing
  */
 
-void SearchEngine::indexApplications() {
+void SearchApplication::indexApplications() {
   _database.clear();
   std::unordered_set<std::string> seen;   // canonical paths, avoids duplicates
 
@@ -98,18 +88,18 @@ void SearchEngine::indexApplications() {
   });
 }
 
-void SearchEngine::addApplication(const std::string &path) {
+void SearchApplication::addApplication(const std::string &path) {
   const std::string fileName = fs::path(path).stem().string();
 
   std::string displayName;
-  if (_resolver) displayName = trim(_resolver(path));
+  if (_resolver) displayName = searchUtils::trim(_resolver(path));
   if (displayName.empty()) displayName = fileName;
 
   Entry e;
   e.app.name = displayName;
   e.app.path = path;
-  e.nameKey = normalize(displayName);
-  e.fileKey = normalize(fileName);
+  e.nameKey = searchUtils::normalize(displayName);
+  e.fileKey = searchUtils::normalize(fileName);
   _database.push_back(std::move(e));
 }
 
@@ -117,73 +107,15 @@ void SearchEngine::addApplication(const std::string &path) {
  * Matching
  */
 
-// ASCII case folding; non ASCII bytes (UTF-8) are kept as they are
-std::string SearchEngine::normalize(const std::string &text) {
-  std::string out = trim(text);
-  for (char &c : out) {
-    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-  }
-  return out;
-}
-
-int SearchEngine::score(const std::string &needle, const std::string &haystack) {
-  if (needle.empty() || haystack.empty()) return 0;
-
-  // 1. exact match
-  if (haystack == needle) return 1000;
-
-  if (needle.size() <= haystack.size()) {
-    const int extra = static_cast<int>(haystack.size() - needle.size());
-
-    // 2. prefix: "saf" -> "safari" (shorter names win)
-    if (haystack.compare(0, needle.size(), needle) == 0) {
-      return 900 - std::min(extra, 99);
-    }
-
-    // 3. substring: at a word start ("code" -> "visual studio code") or anywhere
-    int best = 0;
-    for (std::size_t pos = haystack.find(needle); pos != std::string::npos;
-         pos = haystack.find(needle, pos + 1)) {
-      const int p = std::min(static_cast<int>(pos), 99);
-      const int s = isWordSeparator(haystack[pos - 1]) ? 700 - p : 500 - p;
-      best = std::max(best, s);
-    }
-    if (best > 0) return best;
-  }
-
-  // 4. fuzzy subsequence: "vsc" -> "Visual Studio Code"
-  //    bonus for word starts and consecutive characters, penalty for gaps
-  int s = 100;
-  std::size_t h = 0;
-  std::size_t lastMatch = std::string::npos;
-
-  for (char c : needle) {
-    if (c == ' ') continue;   // spaces in the query are optional
-
-    while (h < haystack.size() && haystack[h] != c) ++h;
-    if (h == haystack.size()) return 0;   // character not found
-
-    if (h == 0 || isWordSeparator(haystack[h - 1])) s += 20;
-    if (lastMatch != std::string::npos) {
-      if (h == lastMatch + 1) s += 10;
-      else s -= static_cast<int>(std::min<std::size_t>(h - lastMatch - 1, 10));
-    }
-
-    lastMatch = h++;
-  }
-
-  return std::clamp(s, 1, 399);
-}
-
-std::vector<AppDetail> SearchEngine::query(const std::string &text, std::size_t limit) const {
-  const std::string needle = normalize(text);
+std::vector<AppDetail> SearchApplication::query(const std::string &text, std::size_t limit) const {
+  const std::string needle = searchUtils::normalize(text);
   if (needle.empty()) return {};
 
   struct Hit { int score; const Entry *entry; };
   std::vector<Hit> hits;
 
   for (const auto &e : _database) {
-    const int s = std::max(score(needle, e.nameKey), score(needle, e.fileKey));
+    const int s = std::max(searchUtils::score(needle, e.nameKey), searchUtils::score(needle, e.fileKey));
     if (s > 0) hits.push_back({s, &e});
   }
 

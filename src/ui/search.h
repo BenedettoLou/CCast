@@ -1,14 +1,29 @@
 #import <Cocoa/Cocoa.h>
 #import "../core/appDetail.hpp"
-#import "../core/searchEngine.hpp"
+#import "../core/searchApplication.hpp"
 #import "../core/searchFile.hpp"
+
+/*
+ *
+ * Application modes:
+ * - APPMODE: search installed applications (default)
+ * - FILEMODE: browse and search files in directories
+ * - CLIPBOARD: clipboard history (not implemented)
+ *
+ */
+typedef NS_ENUM(NSInteger, SearchMode) {
+  APPMODE = 0,
+  FILEMODE,
+  CLIPBOARD
+};
+typedef SearchMode AppMode;
 
 /*
  *
  * UI element for searching
  * - search box (always keeps the keyboard focus)
  * - results list (icon, name, path)
- * - owns the SearchEngine
+ * - owns the SearchApplication
  *
  * Keys: ↑/↓ move selection, Enter launches, Esc clears / closes
  *
@@ -16,11 +31,14 @@
  * "FileMode" badge is shown): the box takes a clean path ("~/bin/", "/usr/",
  * "Desktop" = relative to home) and lists its files.
  * Tab completes the selected entry, Enter reveals the file in Finder,
- * Backspace / Esc on the empty box go back to the app search.
+ * Backspace / Esc on the empty box go back to app mode.
  * 
  */
 
 @interface SearchController : NSObject <NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate>
+
+  // current application mode (APPMODE by default)
+  @property (nonatomic, assign) SearchMode mode;
 
   // the input box where the user types the application name
   @property (nonatomic, strong, readonly) NSTextField *searchField;

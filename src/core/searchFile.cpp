@@ -1,5 +1,5 @@
 #include "searchFile.hpp"
-#include "searchEngine.hpp"   // SearchEngine::score / normalize
+#include "searchUtils.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -46,7 +46,7 @@ std::vector<AppDetail> SearchFile::query(const std::string &text, std::size_t li
 
   if (!isDirectory(dir)) return {};
 
-  const std::string needle = SearchEngine::normalize(name);
+  const std::string needle = searchUtils::normalize(name);
   const bool showHidden = !name.empty() && name[0] == '.';
 
   struct Hit { int score; bool isDir; AppDetail file; };
@@ -65,7 +65,7 @@ std::vector<AppDetail> SearchFile::query(const std::string &text, std::size_t li
     // empty filter ("/Users/me/") lists the whole directory
     int s = 1;
     if (!needle.empty()) {
-      s = SearchEngine::score(needle, SearchEngine::normalize(fileName));
+      s = searchUtils::score(needle, searchUtils::normalize(fileName));
       if (s == 0) continue;
     }
 
@@ -78,7 +78,7 @@ std::vector<AppDetail> SearchFile::query(const std::string &text, std::size_t li
   std::sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) {
     if (a.score != b.score) return a.score > b.score;
     if (a.isDir != b.isDir) return a.isDir;
-    return SearchEngine::normalize(a.file.name) < SearchEngine::normalize(b.file.name);
+    return searchUtils::normalize(a.file.name) < searchUtils::normalize(b.file.name);
   });
 
   if (hits.size() > limit) hits.resize(limit);
