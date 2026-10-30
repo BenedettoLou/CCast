@@ -8,8 +8,6 @@
 /*
  *
  * Pure C++ application index + fuzzy search.
- * No Cocoa dependency: the UI layer can plug in a NameResolver
- * to provide localized display names (e.g. "Calcolatrice").
  *
  */
 class SearchEngine{

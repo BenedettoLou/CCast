@@ -55,6 +55,7 @@ static const CGFloat kAnimTime     = 0.15;  // resize animation duration (second
 
 	_search = [[SearchController alloc] initWithFrame:fieldFrame];
 	[contentView addSubview:_search.searchField];
+	[contentView addSubview:_search.modeBadge];
 
 	// results list, also pinned to the top, right below the search box
 	_search.resultsView.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;

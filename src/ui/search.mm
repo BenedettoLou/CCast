@@ -7,9 +7,17 @@
 static const CGFloat    kRowHeight  = 44.0;
 static const std::size_t kMaxResults = 20;
 
+// "FileMode" badge, on the left of the search box
+static const CGFloat kBadgeWidth  = 78.0;
+static const CGFloat kBadgeHeight = 22.0;
+static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
+
 @implementation SearchController {
   SearchEngine _engine;
-  std::vector<AppDetail> _results;
+  SearchFile _fileEngine;
+  std::vector<AppDetail> _results;   // apps or files, depending on _fileMode
+  BOOL _fileMode;                    // entered by typing '/' in the empty box
+  NSRect _fieldFrame;                // search box frame in app mode
   NSTableView *_tableView;
   NSCache<NSString *, NSImage *> *_iconCache;
 }
@@ -23,10 +31,11 @@ static const std::size_t kMaxResults = 20;
 
     if (self) {
       _iconCache = [[NSCache alloc] init];
+      _fieldFrame = frame;
       [self setupSearchField:frame];
+      [self setupModeBadge:frame];
       [self setupResultsView:frame.size.width];
 
-      // localized names from Finder ("Calcolatrice" instead of "Calculator")
       _engine.setNameResolver([](const std::string &path) -> std::string {
         @autoreleasepool {
           NSString *p = [NSString stringWithUTF8String:path.c_str()];
@@ -60,17 +69,47 @@ static const std::size_t kMaxResults = 20;
     field.cell.wraps = NO;
     field.cell.scrollable = YES;
 
-    field.placeholderAttributedString = [[NSAttributedString alloc]
-      initWithString:@"Search applications..."
-      attributes:@{
-        NSForegroundColorAttributeName : [NSColor colorWithCalibratedWhite:1.0 alpha:0.35],
-        NSFontAttributeName : field.font
-      }];
+    field.placeholderAttributedString = [self placeholder:@"Search applications..."
+                                                     font:field.font];
 
     field.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     field.delegate = self;
 
     _searchField = field;
+  }
+
+  - (NSAttributedString *) placeholder: (NSString *) text font: (NSFont *) font {
+    return [[NSAttributedString alloc]
+      initWithString:text
+      attributes:@{
+        NSForegroundColorAttributeName : [NSColor colorWithCalibratedWhite:1.0 alpha:0.35],
+        NSFontAttributeName : font
+      }];
+  }
+
+  // small rounded "FileMode" label, hidden in app mode
+  - (void) setupModeBadge: (NSRect) fieldFrame {
+    NSRect frame = NSMakeRect(NSMinX(fieldFrame),
+                              NSMidY(fieldFrame) - kBadgeHeight / 2.0,
+                              kBadgeWidth, kBadgeHeight);
+
+    NSView *badge = [[NSView alloc] initWithFrame:frame];
+    badge.wantsLayer = YES;
+    badge.layer.backgroundColor = [[NSColor controlAccentColor] colorWithAlphaComponent:0.85].CGColor;
+    badge.layer.cornerRadius = kBadgeHeight / 2.0;
+    badge.autoresizingMask = NSViewMinYMargin;   // stays at the top, like the box
+    badge.hidden = YES;
+
+    NSTextField *label = [NSTextField labelWithString:@"FileMode"];
+    label.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+    label.textColor = [NSColor whiteColor];
+    label.alignment = NSTextAlignmentCenter;
+    [label sizeToFit];
+    label.frame = NSMakeRect(0, (kBadgeHeight - NSHeight(label.frame)) / 2.0,
+                             kBadgeWidth, NSHeight(label.frame));
+    [badge addSubview:label];
+
+    _modeBadge = badge;
   }
 
   - (void) setupResultsView: (CGFloat) width {
@@ -120,9 +159,46 @@ static const std::size_t kMaxResults = 20;
 
   #pragma mark - Search
 
+  // switches between app search and file browsing:
+  // shows / hides the badge and makes room for it next to the text
+  - (void) setFileMode: (BOOL) on {
+    if (_fileMode == on) return;
+    _fileMode = on;
+
+    // only x / width change: the vertical position is kept as it is, because
+    // the box follows the window when it grows / shrinks (autoresizing) and
+    // the y saved at init time is only valid for the compact window
+    const CGFloat shift = on ? kBadgeWidth + kBadgeGap : 0.0;
+    NSRect frame = _searchField.frame;
+    frame.origin.x = NSMinX(_fieldFrame) + shift;
+    frame.size.width = NSWidth(_fieldFrame) - shift;
+    _searchField.frame = frame;
+    _modeBadge.hidden = !on;
+
+    _searchField.placeholderAttributedString =
+      [self placeholder:(on ? @"~/path/to/file" : @"Search applications...")
+                   font:_searchField.font];
+
+    // the field editor (cursor + typed text) does not follow the new frame:
+    // restart the editing session so the box stays usable
+    NSWindow *window = _searchField.window;
+    if (window && _searchField.currentEditor) {
+      [window makeFirstResponder:_searchField];
+      [_searchField.currentEditor moveToEndOfLine:nil];
+    }
+  }
+
   - (void) updateResults {
+
     const char *text = _searchField.stringValue.UTF8String;
-    _results = _engine.query(text ? text : "", kMaxResults);
+
+    if (_fileMode) {
+      // find file: the box contains a clean path ("~/bin/", "/usr/", "Desktop")
+      _results = _fileEngine.query(text ? text : "", kMaxResults);
+    } else {
+      // search
+      _results = _engine.query(text ? text : "", kMaxResults);
+    }
 
     [_tableView reloadData];
     if (!_results.empty()) {
@@ -149,7 +225,64 @@ static const std::size_t kMaxResults = 20;
 
   - (void) rowClicked: (id) sender {
     (void)sender;
-    [self launchRow:_tableView.clickedRow];
+    if (_fileMode) [self revealRow:_tableView.clickedRow];
+    else [self launchRow:_tableView.clickedRow];
+  }
+
+  #pragma mark - Files
+
+  // Enter in file mode: the typed path wins if it exists ("complete" path),
+  // otherwise the selected result is used
+  - (void) revealTypedPathOrSelection {
+    const char *text = _searchField.stringValue.UTF8String;
+
+    // empty box: there is no typed path, use the selection
+    const std::string path = (text && text[0]) ? SearchFile::expand(text) : std::string();
+
+    if (!path.empty() && SearchFile::exists(path)) {
+      [self revealPath:[NSString stringWithUTF8String:path.c_str()]];
+    } else {
+      [self revealRow:_tableView.selectedRow];
+    }
+  }
+
+  - (void) revealRow: (NSInteger) row {
+    if (row < 0 || row >= static_cast<NSInteger>(_results.size())) {
+      NSBeep();
+      return;
+    }
+    [self revealPath:[NSString stringWithUTF8String:_results[row].path.c_str()]];
+  }
+
+  // opens a Finder window with the file selected
+  - (void) revealPath: (NSString *) path {
+    NSURL *url = [NSURL fileURLWithPath:path.stringByStandardizingPath];
+
+    if (self.onWillLaunch) self.onWillLaunch();
+    [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[url]];
+    if (self.onDidLaunch) self.onDidLaunch(YES);
+  }
+
+  // Tab in file mode: completes the box with the selected entry
+  // (folders get a trailing '/', so their content is listed right away)
+  - (void) completeSelection {
+    const NSInteger row = _tableView.selectedRow;
+    if (row < 0 || row >= static_cast<NSInteger>(_results.size())) {
+      NSBeep();
+      return;
+    }
+
+    std::string path = _results[row].path;
+    if (SearchFile::isDirectory(path)) path += "/";
+
+    // "/Users/me/bin/" is shown as "~/bin/"
+    NSString *full = [NSString stringWithUTF8String:path.c_str()] ?: @"";
+    _searchField.stringValue = full.stringByAbbreviatingWithTildeInPath;
+    if ([full hasSuffix:@"/"] && ![_searchField.stringValue hasSuffix:@"/"]) {
+      _searchField.stringValue = [_searchField.stringValue stringByAppendingString:@"/"];
+    }
+    [_searchField.currentEditor moveToEndOfLine:nil];   // cursor after the text
+    [self updateResults];
   }
 
   - (void) launchRow: (NSInteger) row {
@@ -181,7 +314,9 @@ static const std::size_t kMaxResults = 20;
       }];
   }
 
+  // back to the initial state: empty box, app mode
   - (void) reset {
+    [self setFileMode:NO];
     _searchField.stringValue = @"";
     [self updateResults];
   }
@@ -191,14 +326,27 @@ static const std::size_t kMaxResults = 20;
   // called on every keystroke inside the box
   - (void) controlTextDidChange: (NSNotification *) notification {
     (void)notification;
+
+    // '/' as first character: enter file mode, the '/' itself is consumed
+    // so the box starts with a clean path ("~/bin/", "/usr/", ...).
+    // A pasted absolute path ("/usr/bin") is kept as it is.
+    if (!_fileMode && [_searchField.stringValue hasPrefix:@"/"]) {
+      NSString *text = _searchField.stringValue;
+      [self setFileMode:YES];
+      _searchField.stringValue = (text.length == 1) ? @"" : text;
+      [_searchField.currentEditor moveToEndOfLine:nil];
+    }
+
     [self updateResults];
   }
 
-  // special keys while editing (arrows / Esc / Enter)
+  // special keys while editing (arrows / Esc / Enter / Tab / Backspace)
   - (BOOL) control: (NSControl *) control
            textView: (NSTextView *) textView
            doCommandBySelector: (SEL) commandSelector {
     (void)control; (void)textView;
+
+    const BOOL empty = (_searchField.stringValue.length == 0);
 
     if (commandSelector == @selector(moveDown:)) {
       [self moveSelectionBy:1];
@@ -210,9 +358,18 @@ static const std::size_t kMaxResults = 20;
       return YES;
     }
 
+    // Backspace on the empty box leaves file mode
+    if (commandSelector == @selector(deleteBackward:) && _fileMode && empty) {
+      [self reset];
+      return YES;
+    }
+
     if (commandSelector == @selector(cancelOperation:)) {
-      // Esc: clear the box, or close the launcher if already empty
-      if (_searchField.stringValue.length > 0) {
+      // Esc: clear the box, then leave file mode, then close the launcher
+      if (!empty) {
+        _searchField.stringValue = @"";
+        [self updateResults];
+      } else if (_fileMode) {
         [self reset];
       } else if (self.onDismiss) {
         self.onDismiss();
@@ -221,7 +378,13 @@ static const std::size_t kMaxResults = 20;
     }
 
     if (commandSelector == @selector(insertNewline:)) {
-      [self launchRow:_tableView.selectedRow];
+      if (_fileMode) [self revealTypedPathOrSelection];
+      else [self launchRow:_tableView.selectedRow];
+      return YES;
+    }
+
+    if (commandSelector == @selector(insertTab:) && _fileMode) {
+      [self completeSelection];
       return YES;
     }
 

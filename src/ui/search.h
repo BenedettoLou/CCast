@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import "../core/appDetail.hpp"
 #import "../core/searchEngine.hpp"
+#import "../core/searchFile.hpp"
 
 /*
  *
@@ -10,6 +11,12 @@
  * - owns the SearchEngine
  *
  * Keys: ↑/↓ move selection, Enter launches, Esc clears / closes
+ *
+ * File mode (enter it typing '/' in the empty box; the '/' disappears and a
+ * "FileMode" badge is shown): the box takes a clean path ("~/bin/", "/usr/",
+ * "Desktop" = relative to home) and lists its files.
+ * Tab completes the selected entry, Enter reveals the file in Finder,
+ * Backspace / Esc on the empty box go back to the app search.
  * 
  */
 
@@ -20,6 +27,9 @@
 
   // scrollable results list (the owner positions it)
   @property (nonatomic, strong, readonly) NSScrollView *resultsView;
+
+  // "FileMode" badge, already placed next to the search box (the owner adds it)
+  @property (nonatomic, strong, readonly) NSView *modeBadge;
 
   // called every time the results change (count = number of rows)
   @property (nonatomic, copy) void (^onResultsChanged)(NSUInteger count);

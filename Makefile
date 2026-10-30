@@ -9,7 +9,7 @@ BUILD = build
 
 # Objective-C++ (UI) and pure C++ (core) sources
 SRCS_MM  = src/main.mm src/ui/window.mm src/ui/search.mm src/ui/resultViews.mm src/ui/hotkey.mm
-SRCS_CPP = src/core/searchEngine.cpp
+SRCS_CPP = src/core/searchEngine.cpp src/core/searchFile.cpp
 
 OBJS = $(patsubst src/%,$(BUILD)/%.o,$(SRCS_MM) $(SRCS_CPP))
 
