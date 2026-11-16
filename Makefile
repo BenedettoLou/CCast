@@ -9,7 +9,7 @@ BUILD = build
 
 # Objective-C++ (UI) and pure C++ (core) sources
 SRCS_MM  = src/main.mm src/ui/window.mm src/ui/search.mm src/ui/resultViews.mm src/ui/hotkey.mm
-SRCS_CPP = src/core/searchApplication.cpp src/core/searchFile.cpp src/core/searchUtils.cpp
+SRCS_CPP = src/core/searchApplication.cpp src/core/searchFile.cpp src/core/searchClipboard.cpp src/core/searchUtils.cpp
 
 OBJS = $(patsubst src/%,$(BUILD)/%.o,$(SRCS_MM) $(SRCS_CPP))
 
@@ -36,6 +36,6 @@ run: all
 	./$(TARGET)
 
 compdb:
-	@python3 -c "import subprocess, json, os; cwd = os.getcwd(); res = subprocess.run(['$(MAKE)', '-n', 'all'], capture_output=True, text=True); entries = []; [entries.append({'directory': cwd, 'command': l.strip(), 'file': os.path.abspath(parts[parts.index('-c')+1])}) for l in res.stdout.strip().split('\n') if (parts := l.strip().split()) and '-c' in parts and parts[0] == 'clang++']; open('compile_commands.json', 'w').write(json.dumps(entries, indent=2)); print(f'Generated compile_commands.json ({len(entries)} files)')"
+	@python3 -c "import subprocess, json, os; cwd = os.getcwd(); res = subprocess.run(['$(MAKE)', '-B', '-n', 'all'], capture_output=True, text=True); entries = []; [entries.append({'directory': cwd, 'command': l.strip(), 'file': os.path.abspath(parts[parts.index('-c')+1])}) for l in res.stdout.strip().split('\n') if (parts := l.strip().split()) and '-c' in parts and parts[0] == 'clang++']; open('compile_commands.json', 'w').write(json.dumps(entries, indent=2)); print(f'Generated compile_commands.json ({len(entries)} files)')"
 
 .PHONY: all clean run compdb

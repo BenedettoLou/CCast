@@ -37,6 +37,7 @@
 *.exe
 *.out
 *.app
+ccast
 
 # Build directories
 build/

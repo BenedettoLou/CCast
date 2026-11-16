@@ -2,13 +2,14 @@
 #import "../core/appDetail.hpp"
 #import "../core/searchApplication.hpp"
 #import "../core/searchFile.hpp"
+#import "../core/searchClipboard.hpp"
 
 /*
  *
  * Application modes:
  * - APPMODE: search installed applications (default)
  * - FILEMODE: browse and search files in directories
- * - CLIPBOARD: clipboard history (not implemented)
+ * - CLIPBOARD: search and copy from clipboard history
  *
  */
 typedef NS_ENUM(NSInteger, SearchMode) {
@@ -23,7 +24,7 @@ typedef SearchMode AppMode;
  * UI element for searching
  * - search box (always keeps the keyboard focus)
  * - results list (icon, name, path)
- * - owns the SearchApplication
+ * - owns the SearchApplication, SearchFile, and SearchClipboard
  *
  * Keys: ↑/↓ move selection, Enter launches, Esc clears / closes
  *
@@ -32,6 +33,12 @@ typedef SearchMode AppMode;
  * "Desktop" = relative to home) and lists its files.
  * Tab completes the selected entry, Enter reveals the file in Finder,
  * Backspace / Esc on the empty box go back to app mode.
+ *
+ * Clipboard mode (enter it typing ':' in the empty box; the ':' disappears and a
+ * "Clipboard" badge is shown): lists recent system clipboard entries (text,
+ * screenshots/images, and copied files) and filters them as you type.
+ * Enter copies the selected entry back to the system clipboard and closes the
+ * launcher; Cmd+Backspace deletes the selected entry.
  * 
  */
 
