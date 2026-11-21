@@ -7,6 +7,12 @@ LDFLAGS = -framework Cocoa -framework Carbon
 TARGET = ccast
 BUILD = build
 
+APP_NAME = CCast
+APP_BUNDLE = $(APP_NAME).app
+DMG_NAME = $(APP_NAME).dmg
+DMG_DIR = $(BUILD)/dmg_root
+PLIST = resources/Info.plist
+
 # Objective-C++ (UI) and pure C++ (core) sources
 SRCS_MM  = src/main.mm src/ui/window.mm src/ui/search.mm src/ui/resultViews.mm src/ui/hotkey.mm
 SRCS_CPP = src/core/searchApplication.cpp src/core/searchFile.cpp src/core/searchClipboard.cpp src/core/searchUtils.cpp
@@ -30,7 +36,7 @@ $(BUILD)/%.cpp.o: src/%.cpp
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -rf $(BUILD) $(TARGET) a.out
+	rm -rf $(BUILD) $(TARGET) $(APP_BUNDLE) $(DMG_NAME) a.out
 
 run: all
 	./$(TARGET)
