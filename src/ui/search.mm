@@ -1,5 +1,6 @@
 #import "search.h"
 #import "resultViews.h"
+#import "clipboardMonitor.h"
 
 #include <string>
 #include <vector>
@@ -7,19 +8,29 @@
 static const CGFloat    kRowHeight  = 44.0;
 static const std::size_t kMaxResults = 20;
 
-// "FileMode" badge
-static const CGFloat kBadgeWidth  = 78.0;
+// mode badge ("FileMode" / "Clipboard")
+static const CGFloat kBadgeWidth  = 80.0;
 static const CGFloat kBadgeHeight = 22.0;
 static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
+
+// extra words that make an entry match by type ("image", "file")
+static const char *const kImageSearchTerms = "image screenshot picture png";
+static const char *const kFileSearchTerms  = "file";
 
 @implementation SearchController {
   SearchApplication _searchApplication;
   SearchFile _fileEngine;
-  std::vector<AppDetail> _results;   // apps or files, depending on _mode
+  SearchClipboard _clipboardEngine;
+  std::vector<AppDetail> _results;                 // apps or files (APPMODE / FILEMODE)
+  std::vector<ClipboardItem> _clipboardResults;    // clipboard entries (CLIPBOARD)
   SearchMode _mode;                  // current application mode (APPMODE by default)
   NSRect _fieldFrame;                // search box frame in app mode
+  NSTextField *_modeBadgeLabel;
   NSTableView *_tableView;
   NSCache<NSString *, NSImage *> *_iconCache;
+  ClipboardMonitor *_clipboardMonitor;
+  NSMutableDictionary<NSString *, ClipboardCapture *> *_clipboardImages;   // image id -> data
+  NSImage *_clipboardIcon;
 }
 
   + (CGFloat) rowHeight {
@@ -31,6 +42,7 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
 
     if (self) {
       _iconCache = [[NSCache alloc] init];
+      _clipboardImages = [[NSMutableDictionary alloc] init];
       _fieldFrame = frame;
       _mode = APPMODE;
       [self setupSearchField:frame];
@@ -48,6 +60,17 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
           return name ? std::string(name.UTF8String) : std::string();
         }
       });
+
+      __weak SearchController *weakSelf = self;
+      _clipboardMonitor = [[ClipboardMonitor alloc] initWithHandler:^(ClipboardCapture *capture) {
+        SearchController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if ([strongSelf recordCapture:capture] && strongSelf->_mode == CLIPBOARD) {
+          [strongSelf updateResults];
+        }
+      }];
+      [_clipboardMonitor pollUserInitiated:NO];
+      [_clipboardMonitor start];
     }
 
     return self;
@@ -87,7 +110,7 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
       }];
   }
 
-  // "FileMode" label, hidden in app mode
+  // "FileMode" / "Clipboard" label, hidden in app mode
   - (void) setupModeBadge: (NSRect) fieldFrame {
     NSRect frame = NSMakeRect(NSMinX(fieldFrame),
                               NSMidY(fieldFrame) - kBadgeHeight / 2.0,
@@ -109,6 +132,7 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
                              kBadgeWidth, NSHeight(label.frame));
     [badge addSubview:label];
 
+    _modeBadgeLabel = label;
     _modeBadge = badge;
   }
 
@@ -170,17 +194,21 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
     // only x / width change: the vertical position is kept as it is, because
     // the box follows the window when it grows / shrinks (autoresizing) and
     // the y saved at init time is only valid for the compact window
-    const BOOL isFileMode = (_mode == FILEMODE);
-    const CGFloat shift = isFileMode ? kBadgeWidth + kBadgeGap : 0.0;
+    const BOOL hasBadge = (_mode != APPMODE);
+    const CGFloat shift = hasBadge ? kBadgeWidth + kBadgeGap : 0.0;
     NSRect frame = _searchField.frame;
     frame.origin.x = NSMinX(_fieldFrame) + shift;
     frame.size.width = NSWidth(_fieldFrame) - shift;
     _searchField.frame = frame;
-    _modeBadge.hidden = !isFileMode;
+    _modeBadge.hidden = !hasBadge;
 
     NSString *placeholderText = @"Search applications...";
     if (_mode == FILEMODE) {
+      _modeBadgeLabel.stringValue = @"FileMode";
       placeholderText = @"~/path/to/file";
+    } else if (_mode == CLIPBOARD) {
+      _modeBadgeLabel.stringValue = @"Clipboard";
+      placeholderText = @"Search clipboard...";
     }
     _searchField.placeholderAttributedString =
       [self placeholder:placeholderText font:_searchField.font];
@@ -190,39 +218,52 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
       [window makeFirstResponder:_searchField];
       [_searchField.currentEditor moveToEndOfLine:nil];
     }
+
+    // opening clipboard mode is a user action: read a pending clipboard change
+    // (background polling skips it when CCast is not always allowed to paste)
+    if (_mode == CLIPBOARD) [_clipboardMonitor pollUserInitiated:YES];
   }
 
   #pragma mark - Search
 
+  - (NSInteger) resultCount {
+    const std::size_t n = (_mode == CLIPBOARD) ? _clipboardResults.size() : _results.size();
+    return static_cast<NSInteger>(n);
+  }
+
   - (void) updateResults {
     const char *text = _searchField.stringValue.UTF8String;
+    const std::string query = text ? text : "";
+
+    _results.clear();
+    _clipboardResults.clear();
 
     switch (_mode) {
       case FILEMODE:
-        _results = _fileEngine.query(text ? text : "", kMaxResults);
+        _results = _fileEngine.query(query, kMaxResults);
         break;
       case CLIPBOARD:
-        // clipboard mode is not implemented yet
-        _results.clear();
+        _clipboardResults = _clipboardEngine.query(query, kMaxResults);
         break;
       case APPMODE:
       default:
-        _results = _searchApplication.query(text ? text : "", kMaxResults);
+        _results = _searchApplication.query(query, kMaxResults);
         break;
     }
 
+    const NSInteger count = [self resultCount];
     [_tableView reloadData];
-    if (!_results.empty()) {
+    if (count > 0) {
       [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
       [_tableView scrollRowToVisible:0];
     }
 
-    _resultsView.hidden = _results.empty();
-    if (self.onResultsChanged) self.onResultsChanged(_results.size());
+    _resultsView.hidden = (count == 0);
+    if (self.onResultsChanged) self.onResultsChanged(static_cast<NSUInteger>(count));
   }
 
   - (void) moveSelectionBy: (NSInteger) delta {
-    const NSInteger count = static_cast<NSInteger>(_results.size());
+    const NSInteger count = [self resultCount];
     if (count == 0) return;
 
     NSInteger row = _tableView.selectedRow + delta;
@@ -237,7 +278,127 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
   - (void) rowClicked: (id) sender {
     (void)sender;
     if (_mode == FILEMODE) [self revealRow:_tableView.clickedRow];
+    else if (_mode == CLIPBOARD) [self copyRow:_tableView.clickedRow];
     else [self launchRow:_tableView.clickedRow];
+  }
+
+  #pragma mark - Clipboard
+
+  // stores a new capture in the history; returns YES if the history changed
+  - (BOOL) recordCapture: (ClipboardCapture *) capture {
+    ClipboardItem item;
+    item.kind = capture.kind;
+    std::string extra;
+
+    switch (capture.kind) {
+      case ClipboardKind::Text: {
+        const char *text = capture.text.UTF8String;
+        if (!text) return NO;
+        item.payload = text;
+        break;
+      }
+      case ClipboardKind::File: {
+        NSString *display = capture.filePath.stringByAbbreviatingWithTildeInPath;
+        const char *path = capture.filePath.UTF8String;
+        if (!path) return NO;
+        item.payload = path;
+        item.title = capture.filePath.lastPathComponent.UTF8String ?: "";
+        item.subtitle = [NSString stringWithFormat:@"File · %@", display].UTF8String ?: "";
+        extra = std::string(kFileSearchTerms) + " " + path;
+        break;
+      }
+      case ClipboardKind::Image: {
+        // same image copied again keeps its first title
+        ClipboardCapture *existing = _clipboardImages[capture.imageID];
+        if (existing.title) {
+          capture.title = existing.title;
+        } else {
+          NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+          fmt.dateFormat = @"HH:mm:ss";
+          capture.title = [NSString stringWithFormat:@"Image %@", [fmt stringFromDate:[NSDate date]]];
+        }
+        _clipboardImages[capture.imageID] = capture;
+        item.payload = capture.imageID.UTF8String;
+        item.title = capture.title.UTF8String;
+        item.subtitle = capture.subtitle.UTF8String ?: "";
+        extra = kImageSearchTerms;
+        break;
+      }
+    }
+
+    std::vector<ClipboardItem> evicted;
+    const BOOL added = _clipboardEngine.add(std::move(item), extra, &evicted);
+    if (!added && capture.kind == ClipboardKind::Image) {
+      [_clipboardImages removeObjectForKey:capture.imageID];
+    }
+    [self forgetImagesOf:evicted];
+    return added;
+  }
+
+  // drops the image data of entries no longer in the history
+  - (void) forgetImagesOf: (const std::vector<ClipboardItem> &) items {
+    for (const auto &item : items) {
+      if (item.kind != ClipboardKind::Image) continue;
+      NSString *imageID = [NSString stringWithUTF8String:item.payload.c_str()];
+      if (imageID) [_clipboardImages removeObjectForKey:imageID];
+    }
+  }
+
+  // Enter / click in clipboard mode: puts the entry back on the clipboard
+  - (void) copyRow: (NSInteger) row {
+    if (row < 0 || row >= static_cast<NSInteger>(_clipboardResults.size())) {
+      NSBeep();
+      return;
+    }
+
+    const ClipboardItem item = _clipboardResults[row];
+    NSString *payload = [NSString stringWithUTF8String:item.payload.c_str()];
+    if (!payload) {
+      NSBeep();
+      return;
+    }
+
+    switch (item.kind) {
+      case ClipboardKind::Text:
+        [_clipboardMonitor writeText:payload];
+        break;
+      case ClipboardKind::File:
+        [_clipboardMonitor writeFileURL:[NSURL fileURLWithPath:payload]];
+        break;
+      case ClipboardKind::Image: {
+        ClipboardCapture *image = _clipboardImages[payload];
+        if (!image.imageData) {
+          NSBeep();
+          return;
+        }
+        [_clipboardMonitor writeImageData:image.imageData type:image.imageType];
+        break;
+      }
+    }
+
+    _clipboardEngine.promote(item.kind, item.payload);
+    if (self.onDismiss) self.onDismiss();
+  }
+
+  // Cmd+Backspace / Fn+Backspace in clipboard mode: removes the selected entry
+  - (void) deleteSelectedClipboardRow {
+    const NSInteger row = _tableView.selectedRow;
+    if (row < 0 || row >= static_cast<NSInteger>(_clipboardResults.size())) {
+      NSBeep();
+      return;
+    }
+
+    const ClipboardItem item = _clipboardResults[row];
+    _clipboardEngine.remove(item.kind, item.payload);
+    [self forgetImagesOf:{item}];
+
+    [self updateResults];
+    const NSInteger count = [self resultCount];
+    if (count > 0) {
+      const NSInteger nextRow = MIN(row, count - 1);
+      [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:nextRow] byExtendingSelection:NO];
+      [_tableView scrollRowToVisible:nextRow];
+    }
   }
 
   #pragma mark - Files
@@ -341,10 +502,17 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
     // '/' as first character: enter file mode, the '/' itself is consumed
     // so the box starts with a clean path ("~/bin/", "/usr/", ...).
     // A pasted absolute path ("/usr/bin") is kept as it is.
-    if (_mode != FILEMODE && [_searchField.stringValue hasPrefix:@"/"]) {
+    if (_mode == APPMODE && [_searchField.stringValue hasPrefix:@"/"]) {
       NSString *text = _searchField.stringValue;
       [self setMode:FILEMODE];
       _searchField.stringValue = (text.length == 1) ? @"" : text;
+      [_searchField.currentEditor moveToEndOfLine:nil];
+    } else if (_mode == APPMODE && [_searchField.stringValue hasPrefix:@":"]) {
+      // ':' as first character: enter clipboard mode, the ':' itself is consumed
+      // before setMode: triggers an immediate clipboard poll
+      NSString *text = _searchField.stringValue;
+      _searchField.stringValue = [text substringFromIndex:1];
+      [self setMode:CLIPBOARD];
       [_searchField.currentEditor moveToEndOfLine:nil];
     }
 
@@ -369,14 +537,22 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
       return YES;
     }
 
-    // Backspace on the empty box leaves file mode (returns to default APPMODE)
+    // Cmd+Backspace or Fn+Backspace (when empty) in clipboard mode deletes selected entry
+    if (_mode == CLIPBOARD &&
+        (commandSelector == @selector(deleteToBeginningOfLine:) ||
+         (commandSelector == @selector(deleteForward:) && empty))) {
+      [self deleteSelectedClipboardRow];
+      return YES;
+    }
+
+    // Backspace on the empty box leaves file/clipboard mode (returns to default APPMODE)
     if (commandSelector == @selector(deleteBackward:) && _mode != APPMODE && empty) {
       [self reset];
       return YES;
     }
 
     if (commandSelector == @selector(cancelOperation:)) {
-      // Esc: clear the box, then leave file mode, then close the launcher
+      // Esc: clear the box, then leave file/clipboard mode, then close the launcher
       if (!empty) {
         _searchField.stringValue = @"";
         [self updateResults];
@@ -390,6 +566,7 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
 
     if (commandSelector == @selector(insertNewline:)) {
       if (_mode == FILEMODE) [self revealTypedPathOrSelection];
+      else if (_mode == CLIPBOARD) [self copyRow:_tableView.selectedRow];
       else [self launchRow:_tableView.selectedRow];
       return YES;
     }
@@ -406,7 +583,7 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
 
   - (NSInteger) numberOfRowsInTableView: (NSTableView *) tableView {
     (void)tableView;
-    return static_cast<NSInteger>(_results.size());
+    return [self resultCount];
   }
 
   - (NSTableRowView *) tableView: (NSTableView *) tableView rowViewForRow: (NSInteger) row {
@@ -424,14 +601,53 @@ static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
         NSMakeRect(0, 0, tableColumn.width, kRowHeight)];
     }
 
-    const AppDetail &app = _results[row];
-    NSString *path = [NSString stringWithUTF8String:app.path.c_str()];
-
-    cell.nameLabel.stringValue = [NSString stringWithUTF8String:app.name.c_str()] ?: @"";
-    cell.pathLabel.stringValue = path.stringByAbbreviatingWithTildeInPath ?: @"";
-    cell.iconView.image = [self iconForPath:path];
+    if (_mode == CLIPBOARD) {
+      const ClipboardItem &item = _clipboardResults[row];
+      cell.nameLabel.stringValue = [NSString stringWithUTF8String:item.title.c_str()] ?: @"";
+      cell.pathLabel.stringValue = [NSString stringWithUTF8String:item.subtitle.c_str()] ?: @"";
+      cell.iconView.image = [self iconForClipboardItem:item];
+    } else {
+      const AppDetail &app = _results[row];
+      NSString *path = [NSString stringWithUTF8String:app.path.c_str()];
+      cell.nameLabel.stringValue = [NSString stringWithUTF8String:app.name.c_str()] ?: @"";
+      cell.pathLabel.stringValue = path.stringByAbbreviatingWithTildeInPath ?: @"";
+      cell.iconView.image = [self iconForPath:path];
+    }
 
     return cell;
+  }
+
+  - (NSImage *) iconForClipboardItem: (const ClipboardItem &) item {
+    switch (item.kind) {
+      case ClipboardKind::File: {
+        NSString *path = [NSString stringWithUTF8String:item.payload.c_str()];
+        return path ? [self iconForPath:path] : [self clipboardIcon];
+      }
+      case ClipboardKind::Image: {
+        NSString *imageID = [NSString stringWithUTF8String:item.payload.c_str()];
+        ClipboardCapture *image = imageID ? _clipboardImages[imageID] : nil;
+        return image.thumbnail ?: [self clipboardIcon];
+      }
+      case ClipboardKind::Text:
+      default:
+        return [self clipboardIcon];
+    }
+  }
+
+  - (NSImage *) clipboardIcon {
+    if (!_clipboardIcon) {
+      NSImage *img = [NSImage imageWithSystemSymbolName:@"doc.on.clipboard"
+                               accessibilityDescription:@"Clipboard"];
+      if (img) {
+        NSImageSymbolConfiguration *cfg =
+          [NSImageSymbolConfiguration configurationWithPointSize:18
+                                                          weight:NSFontWeightRegular];
+        _clipboardIcon = [img imageWithSymbolConfiguration:cfg];
+      } else {
+        _clipboardIcon = [NSImage imageNamed:NSImageNameMultipleDocuments];
+      }
+    }
+    return _clipboardIcon;
   }
 
   - (NSImage *) iconForPath: (NSString *) path {

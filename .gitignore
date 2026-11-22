@@ -37,6 +37,7 @@
 *.exe
 *.out
 *.app
+/ccast
 
 # Build directories
 build/
@@ -66,3 +67,9 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+.idea/
+.vscode/
+# macOS
+.DS_Store
+resources/AppIcon.iconset/
