@@ -72,3 +72,4 @@ Testing/
 .vscode/
 # macOS
 .DS_Store
+resources/AppIcon.iconset/
