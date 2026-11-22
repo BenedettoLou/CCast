@@ -1,7 +1,7 @@
 #import "search.h"
 #import "resultViews.h"
+#import "clipboardMonitor.h"
 
-#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -13,32 +13,24 @@ static const CGFloat kBadgeWidth  = 80.0;
 static const CGFloat kBadgeHeight = 22.0;
 static const CGFloat kBadgeGap    = 8.0;   // space between badge and text
 
-static const NSTimeInterval kClipboardPollInterval = 0.5;
-
-@interface ClipboardImageItem : NSObject
-  @property (nonatomic, strong) NSImage *thumbnail;
-  @property (nonatomic, strong) NSData *pngData;
-  @property (nonatomic, copy) NSString *title;
-  @property (nonatomic, copy) NSString *subtitle;
-@end
-
-@implementation ClipboardImageItem
-@end
+// extra words that make an entry match by type ("image", "file")
+static const char *const kImageSearchTerms = "image screenshot picture png";
+static const char *const kFileSearchTerms  = "file";
 
 @implementation SearchController {
   SearchApplication _searchApplication;
   SearchFile _fileEngine;
   SearchClipboard _clipboardEngine;
-  std::vector<AppDetail> _results;   // apps, files, or clipboard entries, depending on _mode
+  std::vector<AppDetail> _results;                 // apps or files (APPMODE / FILEMODE)
+  std::vector<ClipboardItem> _clipboardResults;    // clipboard entries (CLIPBOARD)
   SearchMode _mode;                  // current application mode (APPMODE by default)
   NSRect _fieldFrame;                // search box frame in app mode
   NSTextField *_modeBadgeLabel;
   NSTableView *_tableView;
   NSCache<NSString *, NSImage *> *_iconCache;
-  NSMutableDictionary<NSString *, ClipboardImageItem *> *_clipboardImages;
+  ClipboardMonitor *_clipboardMonitor;
+  NSMutableDictionary<NSString *, ClipboardCapture *> *_clipboardImages;   // image id -> data
   NSImage *_clipboardIcon;
-  NSTimer *_clipboardTimer;
-  NSInteger _lastChangeCount;
 }
 
   + (CGFloat) rowHeight {
@@ -53,7 +45,6 @@ static const NSTimeInterval kClipboardPollInterval = 0.5;
       _clipboardImages = [[NSMutableDictionary alloc] init];
       _fieldFrame = frame;
       _mode = APPMODE;
-      _lastChangeCount = -1;
       [self setupSearchField:frame];
       [self setupModeBadge:frame];
       [self setupResultsView:frame.size.width];
@@ -70,27 +61,19 @@ static const NSTimeInterval kClipboardPollInterval = 0.5;
         }
       });
 
-      [self pollClipboard];
       __weak SearchController *weakSelf = self;
-      _clipboardTimer = [NSTimer scheduledTimerWithTimeInterval:kClipboardPollInterval
-                                                        repeats:YES
-                                                          block:^(NSTimer *timer) {
-        (void)timer;
+      _clipboardMonitor = [[ClipboardMonitor alloc] initWithHandler:^(ClipboardCapture *capture) {
         SearchController *strongSelf = weakSelf;
         if (!strongSelf) return;
-        if ([strongSelf pollClipboard] && strongSelf->_mode == CLIPBOARD) {
+        if ([strongSelf recordCapture:capture] && strongSelf->_mode == CLIPBOARD) {
           [strongSelf updateResults];
         }
       }];
-      // set a tolerance for the clipboard timer to improve power efficiency (MacOS guidelines)
-      _clipboardTimer.tolerance = 0.2;
+      [_clipboardMonitor pollUserInitiated:NO];
+      [_clipboardMonitor start];
     }
 
     return self;
-  }
-
-  - (void) dealloc {
-    [_clipboardTimer invalidate];
   }
 
   - (void) setupSearchField: (NSRect) frame {
@@ -235,39 +218,52 @@ static const NSTimeInterval kClipboardPollInterval = 0.5;
       [window makeFirstResponder:_searchField];
       [_searchField.currentEditor moveToEndOfLine:nil];
     }
+
+    // opening clipboard mode is a user action: read a pending clipboard change
+    // (background polling skips it when CCast is not always allowed to paste)
+    if (_mode == CLIPBOARD) [_clipboardMonitor pollUserInitiated:YES];
   }
 
   #pragma mark - Search
 
+  - (NSInteger) resultCount {
+    const std::size_t n = (_mode == CLIPBOARD) ? _clipboardResults.size() : _results.size();
+    return static_cast<NSInteger>(n);
+  }
+
   - (void) updateResults {
     const char *text = _searchField.stringValue.UTF8String;
+    const std::string query = text ? text : "";
+
+    _results.clear();
+    _clipboardResults.clear();
 
     switch (_mode) {
       case FILEMODE:
-        _results = _fileEngine.query(text ? text : "", kMaxResults);
+        _results = _fileEngine.query(query, kMaxResults);
         break;
       case CLIPBOARD:
-        [self pollClipboard];
-        _results = _clipboardEngine.query(text ? text : "", kMaxResults);
+        _clipboardResults = _clipboardEngine.query(query, kMaxResults);
         break;
       case APPMODE:
       default:
-        _results = _searchApplication.query(text ? text : "", kMaxResults);
+        _results = _searchApplication.query(query, kMaxResults);
         break;
     }
 
+    const NSInteger count = [self resultCount];
     [_tableView reloadData];
-    if (!_results.empty()) {
+    if (count > 0) {
       [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
       [_tableView scrollRowToVisible:0];
     }
 
-    _resultsView.hidden = _results.empty();
-    if (self.onResultsChanged) self.onResultsChanged(_results.size());
+    _resultsView.hidden = (count == 0);
+    if (self.onResultsChanged) self.onResultsChanged(static_cast<NSUInteger>(count));
   }
 
   - (void) moveSelectionBy: (NSInteger) delta {
-    const NSInteger count = static_cast<NSInteger>(_results.size());
+    const NSInteger count = [self resultCount];
     if (count == 0) return;
 
     NSInteger row = _tableView.selectedRow + delta;
@@ -288,238 +284,118 @@ static const NSTimeInterval kClipboardPollInterval = 0.5;
 
   #pragma mark - Clipboard
 
-  - (void) pruneEvictedKey: (const std::string &) evicted {
-    if (evicted.empty()) return;
-    NSString *evictedKey = [NSString stringWithUTF8String:evicted.c_str()];
-    if (evictedKey) [_clipboardImages removeObjectForKey:evictedKey];
-  }
+  // stores a new capture in the history; returns YES if the history changed
+  - (BOOL) recordCapture: (ClipboardCapture *) capture {
+    ClipboardItem item;
+    item.kind = capture.kind;
+    std::string extra;
 
-  // polls NSPasteboard.generalPasteboard for changes; returns YES if a new item was added
-  - (BOOL) pollClipboard {
-    NSPasteboard *pb = [NSPasteboard generalPasteboard];
-    const NSInteger changeCount = pb.changeCount;
-    if (changeCount == _lastChangeCount) return NO;
-    _lastChangeCount = changeCount;
-
-    // Ignore password managers / concealed / transient pasteboard items (nspasteboard.org)
-    NSArray<NSPasteboardType> *types = pb.types;
-    if ([types containsObject:@"org.nspasteboard.ConcealedType"] ||
-        [types containsObject:@"org.nspasteboard.TransientType"]) {
-      return NO;
-    }
-
-    // Copied files from Finder
-    if ([types containsObject:NSPasteboardTypeFileURL]) {
-      NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[[NSURL class]]
-                                                 options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-      NSURL *fileURL = urls.firstObject;
-      if (fileURL.isFileURL && fileURL.path.length > 0) {
-        NSString *filePath = fileURL.path;
-        NSString *fileName = filePath.lastPathComponent;
-        const char *pathUtf8 = filePath.UTF8String;
-        const char *nameUtf8 = fileName.UTF8String;
-        if (pathUtf8 && pathUtf8[0] && nameUtf8 && nameUtf8[0]) {
-          const std::string key = std::string("\x01file:") + pathUtf8;
-          const std::string extra = std::string("file ") + pathUtf8;
-          [self pruneEvictedKey:_clipboardEngine.addEntry(nameUtf8, key, extra)];
-          return YES;
-        }
+    switch (capture.kind) {
+      case ClipboardKind::Text: {
+        const char *text = capture.text.UTF8String;
+        if (!text) return NO;
+        item.payload = text;
+        break;
       }
-      return NO;
-    }
-
-    // Screenshots / copied images
-    NSData *pngData = [pb dataForType:NSPasteboardTypePNG];
-    NSData *tiffData = [pb dataForType:NSPasteboardTypeTIFF];
-
-    if (pngData.length > 0 || tiffData.length > 0) {
-      NSImage *img = [[NSImage alloc] initWithData:(pngData ?: tiffData)];
-      if (img) {
-        if (!pngData && tiffData) {
-          NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithData:tiffData];
-          if (!rep && img.TIFFRepresentation) {
-            rep = [[NSBitmapImageRep alloc] initWithData:img.TIFFRepresentation];
-          }
-          if (rep) {
-            pngData = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
-          }
+      case ClipboardKind::File: {
+        NSString *display = capture.filePath.stringByAbbreviatingWithTildeInPath;
+        const char *path = capture.filePath.UTF8String;
+        if (!path) return NO;
+        item.payload = path;
+        item.title = capture.filePath.lastPathComponent.UTF8String ?: "";
+        item.subtitle = [NSString stringWithFormat:@"File · %@", display].UTF8String ?: "";
+        extra = std::string(kFileSearchTerms) + " " + path;
+        break;
+      }
+      case ClipboardKind::Image: {
+        // same image copied again keeps its first title
+        ClipboardCapture *existing = _clipboardImages[capture.imageID];
+        if (existing.title) {
+          capture.title = existing.title;
+        } else {
+          NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+          fmt.dateFormat = @"HH:mm:ss";
+          capture.title = [NSString stringWithFormat:@"Image %@", [fmt stringFromDate:[NSDate date]]];
         }
-
-        NSData *hashData = pngData ?: tiffData;
-        if (hashData.length > 0) {
-          // 64-bit FNV-1a hash for deterministic deduplication
-          uint64_t hash = 14695981039346656037ULL;
-          const auto *bytes = static_cast<const uint8_t *>(hashData.bytes);
-          for (NSUInteger i = 0; i < hashData.length; ++i) {
-            hash ^= bytes[i];
-            hash *= 1099511628211ULL;
-          }
-
-          NSString *nsKey = [NSString stringWithFormat:@"\x01img:%016llx",
-                             static_cast<unsigned long long>(hash)];
-          const char *keyUtf8 = nsKey.UTF8String;
-          if (keyUtf8 && keyUtf8[0]) {
-            NSInteger width = static_cast<NSInteger>(img.size.width);
-            NSInteger height = static_cast<NSInteger>(img.size.height);
-            NSBitmapImageRep *dimRep = nil;
-            for (NSImageRep *r in img.representations) {
-              if ([r isKindOfClass:[NSBitmapImageRep class]]) {
-                dimRep = static_cast<NSBitmapImageRep *>(r);
-                break;
-              }
-            }
-            if (!dimRep) {
-              dimRep = [NSBitmapImageRep imageRepWithData:hashData];
-            }
-            if (dimRep && dimRep.pixelsWide > 0 && dimRep.pixelsHigh > 0) {
-              width = dimRep.pixelsWide;
-              height = dimRep.pixelsHigh;
-            }
-
-            const NSUInteger kb = MAX(static_cast<NSUInteger>(1), hashData.length / 1024);
-            ClipboardImageItem *existing = _clipboardImages[nsKey];
-            NSString *title = existing ? existing.title : nil;
-            if (!title) {
-              NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-              fmt.dateFormat = @"HH:mm:ss";
-              title = [NSString stringWithFormat:@"Screenshot %@",
-                       [fmt stringFromDate:[NSDate date]]];
-            }
-
-            // Downscale to a compact 32x32 thumbnail to avoid retaining full size bitmaps
-            NSImage *thumb = [[NSImage alloc] initWithSize:NSMakeSize(32, 32)];
-            [thumb lockFocus];
-            [NSGraphicsContext currentContext].imageInterpolation = NSImageInterpolationHigh;
-            const NSSize srcSize = img.size;
-            const CGFloat scale = (srcSize.width > 0 && srcSize.height > 0)
-              ? MIN(32.0 / srcSize.width, 32.0 / srcSize.height) : 1.0;
-            const CGFloat drawW = srcSize.width * scale;
-            const CGFloat drawH = srcSize.height * scale;
-            const NSRect dstRect = NSMakeRect((32.0 - drawW) / 2.0,
-                                              (32.0 - drawH) / 2.0,
-                                              drawW, drawH);
-            [img drawInRect:dstRect
-                   fromRect:NSZeroRect
-                  operation:NSCompositingOperationSourceOver
-                   fraction:1.0];
-            [thumb unlockFocus];
-
-            ClipboardImageItem *item = [[ClipboardImageItem alloc] init];
-            item.thumbnail = thumb;
-            item.pngData = hashData;
-            item.title = title;
-            item.subtitle = [NSString stringWithFormat:@"Image · %ld × %ld · %lu KB",
-                             static_cast<long>(width),
-                             static_cast<long>(height),
-                             static_cast<unsigned long>(kb)];
-
-            _clipboardImages[nsKey] = item;
-            const std::string evicted = _clipboardEngine.addEntry(
-              title.UTF8String ? title.UTF8String : "Screenshot",
-              keyUtf8,
-              "screenshot image png");
-            [self pruneEvictedKey:evicted];
-            return YES;
-          }
-        }
+        _clipboardImages[capture.imageID] = capture;
+        item.payload = capture.imageID.UTF8String;
+        item.title = capture.title.UTF8String;
+        item.subtitle = capture.subtitle.UTF8String ?: "";
+        extra = kImageSearchTerms;
+        break;
       }
     }
 
-    NSString *str = [pb stringForType:NSPasteboardTypeString];
-    if (!str || str.length == 0) return NO;
-
-    const char *utf8 = str.UTF8String;
-    if (!utf8 || !utf8[0]) return NO;
-
-    [self pruneEvictedKey:_clipboardEngine.add(utf8)];
-    return YES;
+    std::vector<ClipboardItem> evicted;
+    const BOOL added = _clipboardEngine.add(std::move(item), extra, &evicted);
+    if (!added && capture.kind == ClipboardKind::Image) {
+      [_clipboardImages removeObjectForKey:capture.imageID];
+    }
+    [self forgetImagesOf:evicted];
+    return added;
   }
 
-  // Enter / click in clipboard mode: copies the selected entry back to NSPasteboard
+  // drops the image data of entries no longer in the history
+  - (void) forgetImagesOf: (const std::vector<ClipboardItem> &) items {
+    for (const auto &item : items) {
+      if (item.kind != ClipboardKind::Image) continue;
+      NSString *imageID = [NSString stringWithUTF8String:item.payload.c_str()];
+      if (imageID) [_clipboardImages removeObjectForKey:imageID];
+    }
+  }
+
+  // Enter / click in clipboard mode: puts the entry back on the clipboard
   - (void) copyRow: (NSInteger) row {
-    if (row < 0 || row >= static_cast<NSInteger>(_results.size())) {
+    if (row < 0 || row >= static_cast<NSInteger>(_clipboardResults.size())) {
       NSBeep();
       return;
     }
 
-    const AppDetail &entry = _results[row];
-    NSString *nsKey = [NSString stringWithUTF8String:entry.path.c_str()];
-    ClipboardImageItem *imgItem = nsKey ? _clipboardImages[nsKey] : nil;
-
-    if (imgItem) {
-      NSPasteboard *pb = [NSPasteboard generalPasteboard];
-      [pb clearContents];
-      NSPasteboardItem *pbItem = [[NSPasteboardItem alloc] init];
-      if (imgItem.pngData) {
-        [pbItem setData:imgItem.pngData forType:NSPasteboardTypePNG];
-        NSImage *decoded = [[NSImage alloc] initWithData:imgItem.pngData];
-        NSData *tiffData = [decoded TIFFRepresentation];
-        if (tiffData) [pbItem setData:tiffData forType:NSPasteboardTypeTIFF];
-      }
-      [pb writeObjects:@[pbItem]];
-      _lastChangeCount = pb.changeCount;
-
-      [self pruneEvictedKey:_clipboardEngine.addEntry(entry.name, entry.path, "screenshot image png")];
-
-      if (self.onDismiss) self.onDismiss();
-      return;
-    }
-
-    if (entry.path.compare(0, 6, "\x01file:") == 0) {
-      const std::string filePath = entry.path.substr(6);
-      NSString *nsFilePath = [NSString stringWithUTF8String:filePath.c_str()];
-      NSURL *fileURL = nsFilePath ? [NSURL fileURLWithPath:nsFilePath] : nil;
-      if (!fileURL) {
-        NSBeep();
-        return;
-      }
-
-      NSPasteboard *pb = [NSPasteboard generalPasteboard];
-      [pb clearContents];
-      [pb writeObjects:@[fileURL]];
-      _lastChangeCount = pb.changeCount;
-
-      [self pruneEvictedKey:_clipboardEngine.addEntry(entry.name, entry.path, "file " + filePath)];
-
-      if (self.onDismiss) self.onDismiss();
-      return;
-    }
-
-    const std::string &rawText = entry.path;
-    NSString *content = [NSString stringWithUTF8String:rawText.c_str()];
-    if (!content) {
+    const ClipboardItem item = _clipboardResults[row];
+    NSString *payload = [NSString stringWithUTF8String:item.payload.c_str()];
+    if (!payload) {
       NSBeep();
       return;
     }
 
-    NSPasteboard *pb = [NSPasteboard generalPasteboard];
-    [pb clearContents];
-    NSPasteboardItem *textItem = [[NSPasteboardItem alloc] init];
-    [textItem setString:content forType:NSPasteboardTypeString];
-    [pb writeObjects:@[textItem]];
-    _lastChangeCount = pb.changeCount;
+    switch (item.kind) {
+      case ClipboardKind::Text:
+        [_clipboardMonitor writeText:payload];
+        break;
+      case ClipboardKind::File:
+        [_clipboardMonitor writeFileURL:[NSURL fileURLWithPath:payload]];
+        break;
+      case ClipboardKind::Image: {
+        ClipboardCapture *image = _clipboardImages[payload];
+        if (!image.imageData) {
+          NSBeep();
+          return;
+        }
+        [_clipboardMonitor writeImageData:image.imageData type:image.imageType];
+        break;
+      }
+    }
 
-    [self pruneEvictedKey:_clipboardEngine.add(rawText)];
-
+    _clipboardEngine.promote(item.kind, item.payload);
     if (self.onDismiss) self.onDismiss();
   }
 
   // Cmd+Backspace / Fn+Backspace in clipboard mode: removes the selected entry
   - (void) deleteSelectedClipboardRow {
     const NSInteger row = _tableView.selectedRow;
-    if (row < 0 || row >= static_cast<NSInteger>(_results.size())) {
+    if (row < 0 || row >= static_cast<NSInteger>(_clipboardResults.size())) {
       NSBeep();
       return;
     }
 
-    const std::string path = _results[row].path;
-    NSString *nsKey = [NSString stringWithUTF8String:path.c_str()];
-    if (nsKey) [_clipboardImages removeObjectForKey:nsKey];
-    _clipboardEngine.remove(path);
+    const ClipboardItem item = _clipboardResults[row];
+    _clipboardEngine.remove(item.kind, item.payload);
+    [self forgetImagesOf:{item}];
 
     [self updateResults];
-    if (!_results.empty()) {
-      const NSInteger nextRow = MIN(row, static_cast<NSInteger>(_results.size()) - 1);
+    const NSInteger count = [self resultCount];
+    if (count > 0) {
+      const NSInteger nextRow = MIN(row, count - 1);
       [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:nextRow] byExtendingSelection:NO];
       [_tableView scrollRowToVisible:nextRow];
     }
@@ -633,9 +509,10 @@ static const NSTimeInterval kClipboardPollInterval = 0.5;
       [_searchField.currentEditor moveToEndOfLine:nil];
     } else if (_mode == APPMODE && [_searchField.stringValue hasPrefix:@":"]) {
       // ':' as first character: enter clipboard mode, the ':' itself is consumed
+      // before setMode: triggers an immediate clipboard poll
       NSString *text = _searchField.stringValue;
-      [self setMode:CLIPBOARD];
       _searchField.stringValue = [text substringFromIndex:1];
+      [self setMode:CLIPBOARD];
       [_searchField.currentEditor moveToEndOfLine:nil];
     }
 
@@ -706,7 +583,7 @@ static const NSTimeInterval kClipboardPollInterval = 0.5;
 
   - (NSInteger) numberOfRowsInTableView: (NSTableView *) tableView {
     (void)tableView;
-    return static_cast<NSInteger>(_results.size());
+    return [self resultCount];
   }
 
   - (NSTableRowView *) tableView: (NSTableView *) tableView rowViewForRow: (NSInteger) row {
@@ -724,28 +601,15 @@ static const NSTimeInterval kClipboardPollInterval = 0.5;
         NSMakeRect(0, 0, tableColumn.width, kRowHeight)];
     }
 
-    const AppDetail &app = _results[row];
-    cell.nameLabel.stringValue = [NSString stringWithUTF8String:app.name.c_str()] ?: @"";
-
     if (_mode == CLIPBOARD) {
-      if (app.path.compare(0, 6, "\x01file:") == 0) {
-        NSString *filePath = [NSString stringWithUTF8String:app.path.c_str() + 6];
-        cell.pathLabel.stringValue = [NSString stringWithFormat:@"File · %@",
-          filePath.stringByAbbreviatingWithTildeInPath ?: @""];
-        cell.iconView.image = filePath ? [self iconForPath:filePath] : [self clipboardIcon];
-      } else {
-        NSString *key = [NSString stringWithUTF8String:app.path.c_str()];
-        ClipboardImageItem *imgItem = key ? _clipboardImages[key] : nil;
-        if (imgItem) {
-          cell.pathLabel.stringValue = imgItem.subtitle ?: @"Image";
-          cell.iconView.image = imgItem.thumbnail ?: [self clipboardIcon];
-        } else {
-          cell.pathLabel.stringValue = [self subtitleForClipboardText:app.path];
-          cell.iconView.image = [self clipboardIcon];
-        }
-      }
+      const ClipboardItem &item = _clipboardResults[row];
+      cell.nameLabel.stringValue = [NSString stringWithUTF8String:item.title.c_str()] ?: @"";
+      cell.pathLabel.stringValue = [NSString stringWithUTF8String:item.subtitle.c_str()] ?: @"";
+      cell.iconView.image = [self iconForClipboardItem:item];
     } else {
+      const AppDetail &app = _results[row];
       NSString *path = [NSString stringWithUTF8String:app.path.c_str()];
+      cell.nameLabel.stringValue = [NSString stringWithUTF8String:app.name.c_str()] ?: @"";
       cell.pathLabel.stringValue = path.stringByAbbreviatingWithTildeInPath ?: @"";
       cell.iconView.image = [self iconForPath:path];
     }
@@ -753,16 +617,21 @@ static const NSTimeInterval kClipboardPollInterval = 0.5;
     return cell;
   }
 
-  - (NSString *) subtitleForClipboardText: (const std::string &) text {
-    std::size_t lines = 1;
-    for (char c : text) {
-      if (c == '\n') ++lines;
+  - (NSImage *) iconForClipboardItem: (const ClipboardItem &) item {
+    switch (item.kind) {
+      case ClipboardKind::File: {
+        NSString *path = [NSString stringWithUTF8String:item.payload.c_str()];
+        return path ? [self iconForPath:path] : [self clipboardIcon];
+      }
+      case ClipboardKind::Image: {
+        NSString *imageID = [NSString stringWithUTF8String:item.payload.c_str()];
+        ClipboardCapture *image = imageID ? _clipboardImages[imageID] : nil;
+        return image.thumbnail ?: [self clipboardIcon];
+      }
+      case ClipboardKind::Text:
+      default:
+        return [self clipboardIcon];
     }
-    NSString *nsText = [NSString stringWithUTF8String:text.c_str()];
-    const NSUInteger chars = nsText ? nsText.length : text.size();
-    return [NSString stringWithFormat:@"%zu %@ · %lu %@",
-            lines, (lines == 1 ? @"line" : @"lines"),
-            (unsigned long)chars, (chars == 1 ? @"char" : @"chars")];
   }
 
   - (NSImage *) clipboardIcon {

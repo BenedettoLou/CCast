@@ -2,7 +2,7 @@ CXX = clang++
 CXXFLAGS = -std=c++20 -Wall -Wextra -Isrc
 OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
 DEPFLAGS = -MMD -MP
-LDFLAGS = -framework Cocoa -framework Carbon
+LDFLAGS = -framework Cocoa -framework Carbon -framework ImageIO
 
 TARGET = ccast
 BUILD = build
@@ -14,7 +14,7 @@ DMG_DIR = $(BUILD)/dmg_root
 PLIST = resources/Info.plist
 
 # Objective-C++ (UI) and pure C++ (core) sources
-SRCS_MM  = src/main.mm src/ui/window.mm src/ui/search.mm src/ui/resultViews.mm src/ui/hotkey.mm
+SRCS_MM  = src/main.mm src/ui/window.mm src/ui/search.mm src/ui/resultViews.mm src/ui/hotkey.mm src/ui/clipboardMonitor.mm
 SRCS_CPP = src/core/searchApplication.cpp src/core/searchFile.cpp src/core/searchClipboard.cpp src/core/searchUtils.cpp
 
 OBJS = $(patsubst src/%,$(BUILD)/%.o,$(SRCS_MM) $(SRCS_CPP))
@@ -41,7 +41,33 @@ clean:
 run: all
 	./$(TARGET)
 
+app: $(TARGET) $(PLIST)
+	@echo "Packaging $(APP_BUNDLE)..."
+	@rm -rf $(APP_BUNDLE)
+	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
+	@mkdir -p $(APP_BUNDLE)/Contents/Resources
+	@cp $(TARGET) $(APP_BUNDLE)/Contents/MacOS/$(TARGET)
+	@cp $(PLIST) $(APP_BUNDLE)/Contents/Info.plist
+	@if [ -f resources/AppIcon.icns ]; then cp resources/AppIcon.icns $(APP_BUNDLE)/Contents/Resources/; fi
+	@codesign --force --deep --sign - $(APP_BUNDLE) 2>/dev/null || true
+	@echo "Created $(APP_BUNDLE)"
+
+dmg: app
+	@echo "Creating $(DMG_NAME)..."
+	@rm -rf $(DMG_DIR) $(DMG_NAME)
+	@mkdir -p $(DMG_DIR)
+	@cp -R $(APP_BUNDLE) $(DMG_DIR)/
+	@ln -s /Applications $(DMG_DIR)/Applications
+	@hdiutil create -volname "$(APP_NAME)" -srcfolder "$(DMG_DIR)" -ov -format UDZO "$(DMG_NAME)"
+	@rm -rf $(DMG_DIR)
+	@echo "Created $(DMG_NAME)"
+
+test: $(BUILD)/core/searchClipboard.cpp.o $(BUILD)/core/searchUtils.cpp.o tests/test_searchClipboard.cpp
+	@mkdir -p $(BUILD)/tests
+	$(CXX) $(CXXFLAGS) tests/test_searchClipboard.cpp $(BUILD)/core/searchClipboard.cpp.o $(BUILD)/core/searchUtils.cpp.o -o $(BUILD)/tests/test_searchClipboard
+	./$(BUILD)/tests/test_searchClipboard
+
 compdb:
 	@python3 -c "import subprocess, json, os; cwd = os.getcwd(); res = subprocess.run(['$(MAKE)', '-B', '-n', 'all'], capture_output=True, text=True); entries = []; [entries.append({'directory': cwd, 'command': l.strip(), 'file': os.path.abspath(parts[parts.index('-c')+1])}) for l in res.stdout.strip().split('\n') if (parts := l.strip().split()) and '-c' in parts and parts[0] == 'clang++']; open('compile_commands.json', 'w').write(json.dumps(entries, indent=2)); print(f'Generated compile_commands.json ({len(entries)} files)')"
 
-.PHONY: all clean run compdb
+.PHONY: all clean run app dmg test compdb
